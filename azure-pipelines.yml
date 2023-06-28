@@ -1,0 +1,121 @@
+trigger:
+  - {{ branch }}
+
+resources:
+  - repo: self
+
+variables:
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: '{{ containerRegistryConnection.Id }}'
+  imageRepository: '{{#toAlphaNumericString imageRepository 50}}{{/toAlphaNumericString}}'
+  containerRegistry: '{{ containerRegistryConnection.Authorization.Parameters.loginServer }}'
+  dockerfilePath: '**/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: '{{#toAlphaNumericString containerRegistryConnection.Name 50}}{{/toAlphaNumericString}}{{#shortGuid}}{{/shortGuid}}-auth'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  {{#if reviewApp}}
+  # Name of the new namespace being created to deploy the PR changes.
+  k8sNamespaceForPR: 'review-app-$(System.PullRequest.PullRequestId)'
+  {{/if}}
+
+stages:
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+    - upload: manifests
+      artifact: manifests
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+
+  jobs:
+  - deployment: Deploy
+    {{#if reviewApp}}
+    condition: and(succeeded(), not(startsWith(variables['Build.SourceBranch'], 'refs/pull/')))
+    {{/if}}
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: '{{ k8sResource.EnvironmentReference.Name }}.{{ k8sResource.Name }}'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
+{{#if reviewApp}}
+  - deployment: DeployPullRequest
+    displayName: Deploy Pull request
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/pull/'))
+    pool:
+      vmImage: $(vmImageName)
+
+    environment: '{{ k8sResource.EnvironmentReference.Name }}.$(k8sNamespaceForPR)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - reviewApp: {{ k8sResource.Name }}
+
+          - task: Kubernetes@1
+            displayName: 'Create a new namespace for the pull request'
+            inputs:
+              command: apply
+              useConfigurationFile: true
+              inline: '{ "kind": "Namespace", "apiVersion": "v1", "metadata": { "name": "$(k8sNamespaceForPR)" }}'
+
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              namespace: $(k8sNamespaceForPR)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              namespace: $(k8sNamespaceForPR)
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
+{{/if}}
